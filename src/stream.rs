@@ -73,6 +73,10 @@ pub struct Stream {
     session_state: SessionState,
     /// Reference to session config for max_frame_size
     config: Arc<Config>,
+    /// Cumulative number of bytes consumed by the application (smux v2 flow control)
+    upd_consumed: u32,
+    /// Value of `upd_consumed` at the moment the last UPDATE frame was sent
+    upd_last_sent: u32,
 }
 
 impl Stream {
@@ -92,6 +96,8 @@ impl Stream {
             is_write_closed: Arc::new(AtomicBool::new(false)),
             session_state,
             config,
+            upd_consumed: 0,
+            upd_last_sent: 0,
         }
     }
 
@@ -161,6 +167,9 @@ impl AsyncRead for Stream {
                     this.current_chunk = None;
                 }
 
+                // smux v2 flow control: tell the peer how much we consumed
+                this.maybe_send_update(to_copy as u32);
+
                 return Poll::Ready(Ok(()));
             }
         }
@@ -174,6 +183,9 @@ impl AsyncRead for Stream {
 
                     // Return tokens for consumed data
                     this.session_state.return_tokens(to_copy);
+
+                    // smux v2 flow control: tell the peer how much we consumed
+                    this.maybe_send_update(to_copy as u32);
 
                     if !chunk.is_empty() {
                         this.current_chunk = Some(chunk);
@@ -192,6 +204,36 @@ impl AsyncRead for Stream {
                     Poll::Pending
                 }
             }
+        }
+    }
+}
+
+/// Minimum amount of consumed bytes before an UPDATE frame is sent.
+/// Matches the granularity used by the Go implementation (32 KiB).
+const UPDATE_THRESHOLD: u32 = 32 * 1024;
+
+impl Stream {
+    /// Sends a smux v2 `UPD` frame when the application has consumed at least
+    /// `UPDATE_THRESHOLD` bytes since the previous update.
+    ///
+    /// Without these frames the peer's send window is never reopened: the
+    /// connection works for the first ~window bytes and then goes silent.
+    fn maybe_send_update(&mut self, consumed: u32) {
+        if self.config.version < 2 || consumed == 0 {
+            return;
+        }
+        self.upd_consumed = self.upd_consumed.wrapping_add(consumed);
+        if self.upd_consumed.wrapping_sub(self.upd_last_sent) < UPDATE_THRESHOLD {
+            return;
+        }
+        let frame = Frame::new_upd(
+            self.config.version,
+            self.stream_id,
+            self.upd_consumed,
+            self.config.max_stream_buffer as u32,
+        );
+        if self.frame_tx.try_send(frame).is_ok() {
+            self.upd_last_sent = self.upd_consumed;
         }
     }
 }
@@ -559,4 +601,59 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
         assert!(err.to_string().contains("Session is closed"));
     }
+    #[tokio::test]
+    async fn test_upd_frame_sent_after_consuming_threshold() {
+        let (frame_tx, frame_rx) = flume::bounded(8);
+        let (data_tx, data_rx) = flume::unbounded();
+        let session_state = crate::session::SessionState::new(1 << 20);
+        let mut config = crate::Config::default();
+        config.version = 2;
+        config.max_stream_buffer = 256 * 1024;
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, Arc::new(config));
+
+        // меньше порога: UPDATE не отправляется
+        data_tx.send(Bytes::from(vec![7u8; 16 * 1024])).unwrap();
+        let mut first = vec![0u8; 16 * 1024];
+        stream.read_exact(&mut first).await.unwrap();
+        assert!(
+            frame_rx.try_recv().is_err(),
+            "unexpected UPDATE below the threshold"
+        );
+
+        // перешли порог: ожидаем один UPDATE с накопленными 48 КБ
+        data_tx.send(Bytes::from(vec![7u8; 32 * 1024])).unwrap();
+        let mut second = vec![0u8; 32 * 1024];
+        stream.read_exact(&mut second).await.unwrap();
+        let frame = frame_rx.try_recv().expect("UPDATE frame expected");
+        assert_eq!(frame.version, 2);
+        assert_eq!(frame.stream_id, 123);
+        assert_eq!(
+            frame.cmd,
+            Command::Upd {
+                consumed: 48 * 1024,
+                window: 256 * 1024
+            }
+        );
+    }
+    #[tokio::test]
+    async fn test_no_upd_frames_for_v1() {
+        let (frame_tx, frame_rx) = flume::bounded(8);
+        let (data_tx, data_rx) = flume::unbounded();
+        let session_state = crate::session::SessionState::new(1 << 20);
+        let mut stream = Stream::new(
+            123,
+            frame_tx,
+            data_rx,
+            session_state,
+            Arc::new(crate::Config::default()), // v1 by default
+        );
+
+        data_tx.send(Bytes::from(vec![1u8; 64 * 1024])).unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        stream.read_exact(&mut buf).await.unwrap();
+
+        // v1 has no window updates: nothing may be sent
+        assert!(frame_rx.try_recv().is_err(), "v1 must not send UPD frames");
+    }
+
 }
