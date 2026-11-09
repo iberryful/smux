@@ -73,6 +73,8 @@ pub struct Stream {
     session_state: SessionState,
     /// Reference to session config for max_frame_size
     config: Arc<Config>,
+    /// Waker of the task currently waiting in `poll_read` (known EOF/data wakeup)
+    read_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 }
 
 impl Stream {
@@ -82,6 +84,7 @@ impl Stream {
         data_rx: flume::Receiver<Bytes>,
         session_state: SessionState,
         config: Arc<Config>,
+        read_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
     ) -> Self {
         Self {
             stream_id,
@@ -92,6 +95,7 @@ impl Stream {
             is_write_closed: Arc::new(AtomicBool::new(false)),
             session_state,
             config,
+            read_waker,
         }
     }
 
@@ -188,7 +192,9 @@ impl AsyncRead for Stream {
                 if this.is_read_closed.load(Ordering::Relaxed) {
                     Poll::Ready(Ok(()))
                 } else {
-                    cx.waker().wake_by_ref();
+                    // Register the waker once; the session wakes it when data (or EOF)
+                    // arrives. Self-waking here would busy-spin the whole runtime.
+                    *this.read_waker.lock().unwrap() = Some(cx.waker().clone());
                     Poll::Pending
                 }
             }
@@ -310,7 +316,7 @@ mod tests {
         let session_state = crate::session::SessionState::new(65536);
         let config = Arc::new(crate::Config::default());
 
-        let stream = Stream::new(123, frame_tx, data_rx, session_state, config);
+        let stream = Stream::new(123, frame_tx, data_rx, session_state, config, std::sync::Arc::new(std::sync::Mutex::new(None)));
         assert_eq!(stream.stream_id(), 123);
         assert!(!stream.is_read_closed());
         assert!(!stream.is_write_closed());
@@ -324,7 +330,7 @@ mod tests {
         let session_state = crate::session::SessionState::new(65536);
         let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config, std::sync::Arc::new(std::sync::Mutex::new(None)));
 
         // Send data directly to the data channel
         let test_data = Bytes::from("hello world");
@@ -344,7 +350,7 @@ mod tests {
         let session_state = crate::session::SessionState::new(65536);
         let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config, std::sync::Arc::new(std::sync::Mutex::new(None)));
 
         // Close the data channel to simulate EOF
         drop(data_tx);
@@ -362,7 +368,7 @@ mod tests {
         let session_state = crate::session::SessionState::new(65536);
         let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config, std::sync::Arc::new(std::sync::Mutex::new(None)));
 
         // Write some data
         let test_data = b"hello world";
@@ -383,7 +389,7 @@ mod tests {
         let session_state = crate::session::SessionState::new(65536);
         let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config, std::sync::Arc::new(std::sync::Mutex::new(None)));
 
         // Shutdown the stream
         stream.shutdown().await.unwrap();
@@ -402,7 +408,7 @@ mod tests {
         let session_state = crate::session::SessionState::new(65536);
         let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config, std::sync::Arc::new(std::sync::Mutex::new(None)));
 
         // Close the stream
         stream.close().await.unwrap();
@@ -421,7 +427,7 @@ mod tests {
         let session_state = crate::session::SessionState::new(65536);
         let config = Arc::new(crate::Config::default());
 
-        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config);
+        let mut stream = Stream::new(123, frame_tx, data_rx, session_state, config, std::sync::Arc::new(std::sync::Mutex::new(None)));
 
         // Send multiple data chunks
         let data1 = Bytes::from("hello ");
@@ -449,7 +455,7 @@ mod tests {
         let config = Arc::new(crate::Config::default());
 
         {
-            let _stream = Stream::new(123, frame_tx, data_rx, session_state, config);
+            let _stream = Stream::new(123, frame_tx, data_rx, session_state, config, std::sync::Arc::new(std::sync::Mutex::new(None)));
             // Stream is dropped here
         }
 
@@ -529,6 +535,7 @@ mod tests {
             data_rx,
             session_state.clone(),
             Arc::new(crate::Config::default()),
+            Arc::new(std::sync::Mutex::new(None)),
         );
 
         // Initially, read and write should work normally
@@ -559,4 +566,61 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
         assert!(err.to_string().contains("Session is closed"));
     }
+    #[tokio::test]
+    async fn test_poll_read_registers_waker() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct CountingWake(AtomicUsize);
+        impl std::task::Wake for CountingWake {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+
+        let (frame_tx, _frame_rx) = flume::bounded(8);
+        let (data_tx, data_rx) = flume::unbounded();
+        let session_state = crate::session::SessionState::new(1 << 20);
+        let read_waker = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut stream = Stream::new(
+            123,
+            frame_tx,
+            data_rx,
+            session_state,
+            Arc::new(crate::Config::default()),
+            std::sync::Arc::clone(&read_waker),
+        );
+
+        let counter = std::sync::Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(std::sync::Arc::clone(&counter));
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        // нет данных: poll_read должен вернуть Pending и НЕ будить себя сам
+        let mut first_storage = [0u8; 16];
+        let mut first_buf = ReadBuf::new(&mut first_storage);
+        let first = std::pin::Pin::new(&mut stream).poll_read(&mut cx, &mut first_buf);
+        assert!(matches!(first, std::task::Poll::Pending));
+        assert_eq!(
+            counter.0.load(AtomicOrdering::SeqCst),
+            0,
+            "poll_read must not self-wake (busy spin)"
+        );
+        assert!(
+            read_waker.lock().unwrap().is_some(),
+            "waker should be registered while pending"
+        );
+
+        // данные пришли, сессия будит читателя
+        data_tx.send(Bytes::from_static(b"hello")).unwrap();
+        let stored = read_waker.lock().unwrap().take().unwrap();
+        stored.wake();
+        assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 1);
+
+        let mut second_storage = [0u8; 16];
+        let mut second_buf = ReadBuf::new(&mut second_storage);
+        let second = std::pin::Pin::new(&mut stream).poll_read(&mut cx, &mut second_buf);
+        assert!(matches!(second, std::task::Poll::Ready(Ok(()))));
+        assert_eq!(second_buf.filled(), b"hello");
+    }
+
 }

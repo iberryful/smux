@@ -27,6 +27,8 @@ struct StreamState {
     data_tx: flume::Sender<Bytes>,
     /// Atomic flag for read closed state
     is_read_closed: Arc<AtomicBool>,
+    /// Waker of the task blocked in `Stream::poll_read`
+    read_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 }
 
 #[derive(Debug)]
@@ -356,9 +358,11 @@ impl Session {
         let (data_tx, data_rx) = flume::unbounded();
 
         // Create stream state
+        let read_waker = Arc::new(std::sync::Mutex::new(None));
         let stream_state = StreamState {
             data_tx,
             is_read_closed: Arc::new(AtomicBool::new(false)),
+            read_waker: Arc::clone(&read_waker),
         };
 
         // Create stream
@@ -368,6 +372,7 @@ impl Session {
             data_rx,
             self.inner.state.clone(),
             Arc::clone(&self.inner.config),
+            read_waker,
         );
 
         // Add to streams map
@@ -635,9 +640,11 @@ async fn handle_syn_frame(frame: Frame, inner: &Arc<SessionInner>) -> Result<()>
     let (data_tx, data_rx) = flume::unbounded();
 
     // Create stream state
+    let read_waker = Arc::new(std::sync::Mutex::new(None));
     let stream_state = StreamState {
         data_tx,
         is_read_closed: Arc::new(AtomicBool::new(false)),
+        read_waker: Arc::clone(&read_waker),
     };
 
     // Create stream
@@ -647,6 +654,7 @@ async fn handle_syn_frame(frame: Frame, inner: &Arc<SessionInner>) -> Result<()>
         data_rx,
         inner.state.clone(),
         Arc::clone(&inner.config),
+        read_waker,
     );
 
     // Add to streams map
@@ -673,6 +681,10 @@ async fn handle_fin_frame(frame: Frame, inner: &Arc<SessionInner>) -> Result<()>
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // Close the data channel to signal EOF to the stream
         drop(stream_state.data_tx);
+        // Wake the reader so it observes EOF instead of sleeping forever
+        if let Some(waker) = stream_state.read_waker.lock().unwrap().take() {
+            waker.wake();
+        }
     }
 
     Ok(())
@@ -715,7 +727,10 @@ async fn handle_psh_frame(frame: Frame, inner: &Arc<SessionInner>) -> Result<()>
     if let Some(stream_state) = inner.streams.get(&stream_id) {
         match stream_state.data_tx.send_async(frame.data).await {
             Ok(_) => {
-                // Data successfully sent to stream
+                // Data successfully sent to stream: wake the task waiting in poll_read
+                if let Some(waker) = stream_state.read_waker.lock().unwrap().take() {
+                    waker.wake();
+                }
             }
             Err(_) => {
                 // Stream receiver is closed, return tokens and remove from map
